@@ -15,10 +15,31 @@ from evdev import ecodes
 from selectors import DefaultSelector, EVENT_READ
 from evdev import categorize, UInput
 
+from .actions.WriteText.layout import layout
+
 import threading
 from time import sleep
 import os
 from PIL import Image
+
+# Keys that most keyboards don't have and that therefore can't be recorded by pressing them
+MEDIA_KEYS: dict[int, str] = {
+    ecodes.KEY_PLAYPAUSE: "Play/Pause",
+    ecodes.KEY_PREVIOUSSONG: "Previous",
+    ecodes.KEY_NEXTSONG: "Next",
+    ecodes.KEY_STOPCD: "Stop",
+    ecodes.KEY_MUTE: "Mute",
+    ecodes.KEY_VOLUMEDOWN: "Volume -",
+    ecodes.KEY_VOLUMEUP: "Volume +",
+    ecodes.KEY_BRIGHTNESSDOWN: "Brightness -",
+    ecodes.KEY_BRIGHTNESSUP: "Brightness +",
+    ecodes.KEY_CALC: "Calculator",
+    ecodes.KEY_WWW: "Browser",
+    ecodes.KEY_MAIL: "Mail",
+    ecodes.KEY_HOMEPAGE: "Homepage",
+    ecodes.KEY_SEARCH: "Search",
+    ecodes.KEY_SLEEP: "Sleep"
+}
 
 class Hotkey(ActionBase):
     ACTION_NAME = "Hotkey"
@@ -194,7 +215,7 @@ class HotkeyRecorder(Gtk.ApplicationWindow):
         self.all_keys.update(evdev.ecodes.KEY)
         self.all_keys.update(evdev.ecodes.BTN)
 
-        self.set_default_size(600, 300)
+        self.set_default_size(600, 400)
         self.set_title("Hotkey Recorder")
 
         self.main_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, focus_on_click=True, focusable=True, can_focus=True)
@@ -202,6 +223,10 @@ class HotkeyRecorder(Gtk.ApplicationWindow):
 
         self.explain = Gtk.Label(label="Press keys to record...", margin_top=30)
         self.main_box.append(self.explain)
+
+        self.unreleased_warning = Gtk.Label(css_classes=["bold", "warning"], margin_top=6, margin_start=10,
+                                            margin_end=10, wrap=True, visible=False)
+        self.main_box.append(self.unreleased_warning)
 
         self.scrolled_window = Gtk.ScrolledWindow()
         self.main_box.append(self.scrolled_window)
@@ -261,7 +286,19 @@ class HotkeyRecorder(Gtk.ApplicationWindow):
         special_keys.append(ecodes.KEY_LEFTMETA)
 
         for i in special_keys:
-            self.special_box_flow.append(SpecialKeyButton(self, self.all_keys[i], i))
+            self.special_box_flow.append(SpecialKeyButton(self, self.get_key_name(i), i))
+
+        self.media_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, hexpand=True, vexpand=False,
+                                 margin_start=10, margin_end=10, margin_bottom=10)
+        self.main_box.append(self.media_box)
+
+        self.media_box.append(Gtk.Label(label="Media Keys:", margin_end=8, valign=Gtk.Align.START, margin_top=8))
+
+        self.media_box_flow = Gtk.FlowBox(orientation=Gtk.Orientation.HORIZONTAL, selection_mode=Gtk.SelectionMode.NONE, hexpand=True)
+        self.media_box.append(self.media_box_flow)
+
+        for key_code, key_name in MEDIA_KEYS.items():
+            self.media_box_flow.append(SpecialKeyButton(self, key_name, key_code))
 
         self.connect("destroy", self.on_destroy)
 
@@ -290,19 +327,55 @@ class HotkeyRecorder(Gtk.ApplicationWindow):
         # Notify app that key press was handled
         return True
 
+    def get_key_name(self, key_code: int) -> str:
+        # Key codes name the position of a key on a US keyboard, so show the
+        # character the active layout actually puts there instead
+        table = layout.get_table()
+        if table is not None:
+            label = table.get_label(key_code)
+            if label is not None:
+                return label
+
+        key_name = self.all_keys[key_code]
+        if isinstance(key_name, (list, tuple)):
+            # Some key codes have multiple names
+            key_name = key_name[-1]
+        return key_name
+
     def add_key(self, key_code, state):
         key_code -= self.GTK_CODE_DIFFERENCE
-        key_name = self.all_keys[key_code]
+        key_name = self.get_key_name(key_code)
         self.flow_box.append(PressIndicator(key_name, state == 1, state == 0))
         self.hotkey_row.hotkey.settings["keys"].append([key_code, state])
         self.hotkey_row.hotkey.set_settings(self.hotkey_row.hotkey.settings)
 
+        self.update_unreleased_warning()
+
+    def update_unreleased_warning(self):
+        """
+        Warn about keys that get pressed down but never released - they would stay pressed on the system
+        """
+        pressed: list[int] = []
+        for key_code, state in self.hotkey_row.hotkey.settings.get("keys", []):
+            if state == 1:
+                pressed.append(key_code)
+            elif key_code in pressed:
+                pressed.remove(key_code)
+
+        self.unreleased_warning.set_visible(len(pressed) > 0)
+        if len(pressed) == 0:
+            return
+
+        # dict.fromkeys to remove duplicates while keeping the order
+        key_names = ", ".join(dict.fromkeys(self.get_key_name(key_code) for key_code in pressed))
+        warning = self.hotkey_row.hotkey.plugin_base.lm.get("actions.hotkey.recorder.unreleased-warning")
+        self.unreleased_warning.set_label(f"{warning} {key_names}")
+
     def load_defaults(self):
         for key in self.hotkey_row.hotkey.settings.get("keys", []):
-            key_name = self.all_keys[key[0]]
-            if isinstance(key_name, list):
-                key_name = key_name[0]
-            self.flow_box.append(PressIndicator(key_name, key[1] == 1, key[1] == 0))
+            self.flow_box.append(PressIndicator(self.get_key_name(key[0]), key[1] == 1, key[1] == 0))
+
+        self.update_unreleased_warning()
 
     def on_clear(self, button):
         self.hotkey_row.hotkey.settings["keys"] = []
@@ -311,6 +384,8 @@ class HotkeyRecorder(Gtk.ApplicationWindow):
         # Clear ui
         while self.flow_box.get_first_child() is not None:
             self.flow_box.remove(self.flow_box.get_first_child())
+
+        self.update_unreleased_warning()
 
 
 class SpecialKeyButton(Gtk.Box):
